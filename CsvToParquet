@@ -1,0 +1,59 @@
+%spark
+
+import java.util.Properties
+import org.apache.spark.sql._
+
+Class.forName("oracle.jdbc.driver.OracleDriver") //make sure oracle driver is on the server and included in class path
+
+val jdbcUrl = "jdbc:oracle:thin:@dbservername.com:1521/dbname"
+
+val s3path = "s3://bucketname/path"
+
+val schemaName = "schemaname"
+val tableName = "tablename"
+
+val conPro = new Properties()
+conPro.put("user", "dbuser")
+conPro.put("password", "dbpassword")
+conPro.put("fetchsize", "10000") //adjust to suit database resources and table size
+conPro.put("numPartitions", "200") //adjust to suit database resources and table size
+conPro.setProperty("Driver", "oracle.jdbc.driver.OracleDriver")
+
+val min:Long = 1L //use table stats or similar to profile the table to get these stats dynamically for the table being synced and will result in data spread over number of partitions in connection properties
+val max:Long = 1000000L
+
+val lastSnapshot = "201810040000" //need to look this up from some log or state for the table being extracted and if not set then trigger new snapshot rather than delta
+val thisSnapshot = "201810050000" //need to set this to current date and time
+
+val deltaCriteria = "where dte1 > sysdate -10 or dte2 > sysdate -10 etc..." //set to blank if no lastSnapshot was found so that all rows are extracted
+val primaryKeys = "pk1,pk2,etc..."
+
+val dsDelta = spark.read.jdbc(url = jdbcUrl,table = s"select * from ${schemaName}.${tableName} ${deltaCriteria}",${primaryKeys},min,max,800,conPro).distinct.cache //pk's are used automatically to partition and parrallelalise the read
+
+val dsSnapshot = spark.read.orc(s"${s3path}/${schemaName}/${tableName}/dte=${lastSnapshot}")
+
+val colums = dsDelta.columns //need to check that both delta and snapshot datasets still have matching columns and types
+val columsString = colums.map(p => p._1 + ",")
+
+dsSnapshot.createOrReplaceTempView(s"snapshot_$tableName")
+dsDelta.createOrReplaceTempView(s"delta_$tableName")
+
+val mergequery =
+  s"""select  $columsString from(
+	 |select *,dense_rank() OVER(PARTITION BY $primaryKeys ORDER BY index DESC) as rank from (
+	 |select $columsString, 0 as index from snapshot_$tableName
+	 |union all
+	 |select $columsString, 1 as index from delta_$tableName)) where rank =1
+   """.stripMargin
+
+val dsMerged = spark.sql(mergequery)
+
+val lowerCols = colums.map(p => p.toLowerCase) //to improve hive and spark compatibility make all column headings lowercase in orc regardless of case in original table ddl
+
+val colZip = colums.zip(lowerCols)
+
+val selectExpr = colZip.map(p => p._1 + " as " + p._2) //get column name and data type
+
+val dsFinal = dsMerged.selectExpr(selectExpr:_*) //apply the lowercased schema to the dataset
+
+dsFinal.write.mode(SaveMode.Overwrite).orc(s"${s3path}/${schemaName}/${tableName}/dte=${thisSnapshot}") //by default will split to 200 partitions consider adjusting dynamically to cater for very small or very large tables and might want to align with db fetch partition size though this is not mandatory as the two are independent
